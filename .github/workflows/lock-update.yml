@@ -1,0 +1,59 @@
+name: lock-update
+
+# TIN-7477, R577, design section 3 step 1. Re-resolves a lock directory with
+# the flake's pnpm 10.13.1 (`--lockfile-only --ignore-scripts`, so no package
+# code runs) and uploads the result as an artifact with its diff. It writes
+# nothing to the repository.
+#
+# Lock directories are immutable once merged (tree rule, PR-P1 review S3), so
+# a published plan and the weekly reproduce of its payload always read the
+# lock they were cut from. A person commits the result in an ordinary signed
+# PR as a new directory `locks/<new lock plan name>/`, with the new lock plan
+# and new bundle plan versions that name it. check.yml fails until they agree.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Lock directory to re-resolve (e.g. locks/gftb-site)"
+        required: true
+        default: locks/gftb-site
+        type: string
+
+permissions: {}
+
+jobs:
+  lock-update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: pnpm install --lockfile-only
+        env:
+          SRC: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          [[ "$SRC" =~ ^locks/[A-Za-z0-9_.-]+$ && "$SRC" != *..* ]] || { echo "source must be locks/<name>"; exit 1; }
+          [ -f "$SRC/pnpm-lock.yaml" ] || { echo "no $SRC/pnpm-lock.yaml"; exit 1; }
+          cd "$SRC"
+          nix develop ../..#lock-update -c pnpm install --lockfile-only --ignore-scripts
+      - name: Diff
+        env:
+          SRC: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          git diff --stat -- "$SRC"
+          mkdir -p "$RUNNER_TEMP/lock"
+          cp "$SRC/pnpm-lock.yaml" "$RUNNER_TEMP/lock/"
+          git diff -- "$SRC" > "$RUNNER_TEMP/lock/pnpm-lock.diff" || true
+          sha256sum "$RUNNER_TEMP/lock/pnpm-lock.yaml"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lock-update
+          path: ${{ runner.temp }}/lock
+          retention-days: 7

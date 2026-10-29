@@ -1,0 +1,27 @@
+{
+ "comment": "P0 (R575, R577): gftb-site's pnpm lock and the files rules_js reads with it, moved here from gftb-site. Exported files only.",
+ "files": [
+  ".pnpmfile.cjs",
+  "package.json",
+  "patches/@sveltejs__kit@3.0.1.patch",
+  "patches/README.md",
+  "patches/devalue@5.9.4.patch",
+  "patches/svelte-check@4.7.6.patch",
+  "patches/upstream/README.md",
+  "patches/upstream/sveltejs-devalue-thenable-message.diff",
+  "patches/upstream/sveltejs-kit-sync-typescript7.diff",
+  "patches/upstream/sveltejs-language-tools-svelte-check-tsgo-stale-emit.diff",
+  "patches/upstream/sveltejs-language-tools-svelte-check-tsgo-typescript7.diff",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml"
+ ],
+ "kind": "npm-lock",
+ "lock_sha256": "c1c6f5edda832de12de788d8a15011cfa0a5d108fdee2e3ae03a8912ff3e7631",
+ "module": "xoxd_npm_gftb_site_lock",
+ "not_exported": [
+  ".npmrc"
+ ],
+ "source": "locks/gftb-site",
+ "source_ref": "Great-Falls-Tool-Bus/gftb-site#168 head 7cd2b83dd83b0a967149abbbc6d3613f84e74fa8",
+ "version": "1.0.0"
+}

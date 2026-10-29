@@ -1,0 +1,243 @@
+name: publish
+
+# TIN-7477, R575, R581 (act eff34be5), R582. Design: R575 round 2, section 3.
+#
+# fetch-pack  GitHub-hosted. The only job that reads npm and nodejs.org for a
+#             publish. Every tarball is checked against its lock sha512, Node
+#             against the signed SHASUMS256.txt and the rules_nodejs table.
+# attest      build provenance for every published file.
+# propose     pushes a payload/<run> branch through the Git Data API with this
+#             workflow's own GITHUB_TOKEN (GitHub-signed commits) and opens the
+#             PR. That PR does not trigger workflows, so a reviewer dispatches
+#             check.yml and reproduce.yml against it.
+#
+# attest and propose run only on a workflow_dispatch from refs/heads/main with
+# publish=true (C3.2). A dispatch with publish=false is a dry run: fetch and
+# pack, then a job artifact, nothing else.
+#
+# The `if:` guard is advisory against a writer: a dispatch from another branch
+# runs that branch's copy of this file. The server-side guard is the `publish`
+# environment on attest and propose, whose deployment branch policy the
+# operator sets to `main` (README, "Operator preconditions"). Provenance
+# verification with `--source-ref refs/heads/main` and reproduce.yml still
+# catch anything published from elsewhere (PR-P1 review S4).
+
+on:
+  workflow_dispatch:
+    inputs:
+      plans:
+        description: "Plan names under plans/, space separated (e.g. xoxd_npm_gftb_site_lock-1.0.0 xoxd_npm_gftb_site_lint-1.0.0 node-v22.22.0)"
+        required: true
+        type: string
+      publish:
+        description: "Attest and open the payload PR (main only)"
+        required: true
+        default: false
+        type: boolean
+      linear:
+        description: "Linear issue the payload PR body starts with (e.g. TIN-7477)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  fetch-pack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      plans: ${{ steps.plans.outputs.plans }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Validate inputs
+        id: plans
+        env:
+          PLANS: ${{ inputs.plans }}
+          LINEAR: ${{ inputs.linear }}
+        run: |
+          set -euo pipefail
+          [[ "$LINEAR" =~ ^[A-Z]+-[0-9]+$ ]] || { echo "linear must look like TIN-1234"; exit 1; }
+          out=""
+          for p in $PLANS; do
+            [[ "$p" =~ ^[a-z0-9_.-]+$ ]] || { echo "bad plan name: $p"; exit 1; }
+            [ -f "plans/$p.json" ] || { echo "no plans/$p.json"; exit 1; }
+            out="$out plans/$p.json"
+          done
+          [ -n "$out" ] || { echo "no plans given"; exit 1; }
+          echo "plans=${out# }" >> "$GITHUB_OUTPUT"
+      - name: Fetch (the one npm and nodejs.org read of this publish)
+        env:
+          PLANS: ${{ steps.plans.outputs.plans }}
+        run: |
+          set -euo pipefail
+          read -ra P <<< "$PLANS"
+          nix develop -c python3 -I tools/payloads.py fetch "${P[@]}" --out "$RUNNER_TEMP/fetched"
+      - name: Pack (offline, deterministic)
+        env:
+          PLANS: ${{ steps.plans.outputs.plans }}
+        run: |
+          set -euo pipefail
+          read -ra P <<< "$PLANS"
+          nix develop -c python3 -I tools/payloads.py pack "${P[@]}" --fetched "$RUNNER_TEMP/fetched" --out "$RUNNER_TEMP/out" | tee "$RUNNER_TEMP/pack.json"
+          for p in "${P[@]}"; do
+            nix develop -c python3 -I tools/payloads.py closure "$p" > "$RUNNER_TEMP/closure-$(basename "$p" .json).txt" 2>/dev/null || true
+          done
+      - name: Refuse to overwrite a published path
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/out"
+          for f in $(find payloads node -type f 2>/dev/null | sort); do
+            if [ -e "$GITHUB_WORKSPACE/$f" ]; then echo "$f is already published"; exit 1; fi
+          done
+      - name: Receipt
+        env:
+          RUNNER_CLASS: ubuntu-24.04
+        run: |
+          set -euo pipefail
+          nix develop -c python3 -I - "$RUNNER_TEMP" <<'PY'
+          import json, os, sys
+          tmp = sys.argv[1]
+          r = json.load(open(os.path.join(tmp, "fetched", "fetch-receipt.json")))
+          r["run"] = {k: os.environ.get(k) for k in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "GITHUB_REF", "GITHUB_WORKFLOW_REF", "RUNNER_OS", "RUNNER_ARCH", "RUNNER_ENVIRONMENT", "RUNNER_CLASS")}
+          r["outputs"] = json.load(open(os.path.join(tmp, "pack.json")))
+          json.dump(r, open(os.path.join(tmp, "receipt.json"), "w"), indent=1, sort_keys=True)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: payload
+          path: |
+            ${{ runner.temp }}/out
+            ${{ runner.temp }}/receipt.json
+            ${{ runner.temp }}/closure-*.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    needs: fetch-pack
+    if: github.ref == 'refs/heads/main' && inputs.publish
+    environment: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: payload
+          path: payload
+      - id: attest
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            payload/out/payloads/**
+            payload/out/node/**
+      - name: Keep the bundle with the payload
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          mkdir -p payload/out/attestations
+          cp "$BUNDLE" "payload/out/attestations/publish-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.sigstore.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: attested
+          path: payload
+          if-no-files-found: error
+          retention-days: 7
+
+  propose:
+    needs: attest
+    if: github.ref == 'refs/heads/main' && inputs.publish
+    environment: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: attested
+          path: ${{ runner.temp }}/attested
+      - name: Stage the payload on top of main
+        env:
+          LINEAR: ${{ inputs.linear }}
+          PLANS: ${{ inputs.plans }}
+        run: |
+          set -euo pipefail
+          A="$RUNNER_TEMP/attested"
+          S="$RUNNER_TEMP/staging"
+          mkdir -p "$S/receipts"
+          (cd "$A/out" && find payloads node attestations -type f | sort) > "$RUNNER_TEMP/new-files.txt"
+          while read -r f; do
+            mkdir -p "$S/$(dirname "$f")" "$(dirname "$f")"
+            cp "$A/out/$f" "$S/$f"
+            cp "$A/out/$f" "$f"
+          done < "$RUNNER_TEMP/new-files.txt"
+          cp "$A/receipt.json" "$S/receipts/publish-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          nix develop -c python3 -I tools/payloads.py sums --root .
+          cp SHA256SUMS "$S/SHA256SUMS"
+          {
+            echo "Linear: $LINEAR"
+            echo
+            echo "Payload publish from \`publish.yml\` run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT}) at main \`${GITHUB_SHA}\`. Plans: \`${PLANS}\`."
+            echo
+            echo "This PR was opened with the workflow's own GITHUB_TOKEN, so no workflow ran on it. Before review, dispatch \`check.yml\` and \`reproduce.yml\` from main with this PR's number. Both must post success: \`bazel-payloads/check\` and \`bazel-payloads/reproduce\`."
+            echo
+            echo "Reviewer checklist:"
+            echo
+            echo "- [ ] \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY} --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/publish.yml --source-ref refs/heads/main --deny-self-hosted-runners\` passes for every new archive."
+            echo "- [ ] Each bundle MANIFEST's sha512 set equals the P0 lock's entries for that bundle, and \`p0_lock_sha256\` equals the lock."
+            echo "- [ ] \`bazel-payloads/reproduce\` is success and names \`tinyland-nix\`."
+            echo
+            echo "New files (sha256):"
+            echo
+            echo '```'
+            grep -F -f <(sed 's/^/  /' "$RUNNER_TEMP/new-files.txt") SHA256SUMS || true
+            echo '```'
+            for c in "$A"/closure-*.txt; do
+              [ -s "$c" ] || continue
+              echo
+              echo "<details><summary>Closure: $(basename "$c" .txt | sed 's/^closure-//') ($(grep -c . "$c") entries)</summary>"
+              echo
+              echo '```'
+              cat "$c"
+              echo '```'
+              echo "</details>"
+            done
+            echo
+            echo "<details><summary>Fetch receipt</summary>"
+            echo
+            echo '```json'
+            cat "$A/receipt.json"
+            echo '```'
+            echo "</details>"
+          } > "$RUNNER_TEMP/body.md"
+          head -c 60000 "$RUNNER_TEMP/body.md" > "$RUNNER_TEMP/body.trimmed.md"
+      - name: Open the payload PR (GitHub-signed commit, own GITHUB_TOKEN)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PLANS: ${{ inputs.plans }}
+        run: |
+          set -euo pipefail
+          nix develop -c python3 -I tools/propose.py \
+            --base "$GITHUB_SHA" \
+            --staging "$RUNNER_TEMP/staging" \
+            --branch "payload/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --title "payload: ${PLANS}" \
+            --body "$RUNNER_TEMP/body.trimmed.md"

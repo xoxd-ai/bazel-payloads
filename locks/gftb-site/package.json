@@ -1,0 +1,71 @@
+{
+	"name": "gftb-site",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Public static microsite for the Great Falls Tool Bus",
+	"homepage": "https://greatfallstoolbus.org",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Great-Falls-Tool-Bus/gftb-site.git"
+	},
+	"license": "Zlib",
+	"packageManager": "pnpm@10.13.1",
+	"engines": {
+		"node": "^22.17.0 || >=24 <25"
+	},
+	"imports": {
+		"#lib/*": "./src/lib/*"
+	},
+	"scripts": {
+		"dev": "just dev",
+		"build": "just build",
+		"preview": "just preview-only",
+		"check": "just typecheck",
+		"check:watch": "just typecheck-watch",
+		"lint": "just lint",
+		"format": "just format",
+		"format:check": "just format-check",
+		"test": "just test-unit",
+		"test:unit": "just test-unit",
+		"test:coverage": "just test-coverage",
+		"test:e2e": "just test-e2e",
+		"analyze": "just analyze"
+	},
+	"dependencies": {
+		"@fontsource-variable/fira-code": "^5.2.7",
+		"@fontsource-variable/fraunces": "^5.2.9",
+		"@fontsource/crimson-pro": "^5.2.8",
+		"@fontsource/inter": "^5.3.0"
+	},
+	"devDependencies": {
+		"@eslint/js": "^10.0.1",
+		"@playwright/test": "1.64.0",
+		"@skeletonlabs/skeleton": "5.0.1",
+		"@skeletonlabs/skeleton-svelte": "5.0.1",
+		"@sveltejs/adapter-static": "4.0.0",
+		"@sveltejs/kit": "3.0.1",
+		"@sveltejs/vite-plugin-svelte": "7.3.1",
+		"@tailwindcss/vite": "^4.3.3",
+		"@types/node": "^22.20.1",
+		"@typescript/typescript6": "6.0.2",
+		"@vitest/coverage-v8": "5.0.3",
+		"eslint": "^10.10.0",
+		"eslint-config-prettier": "^10.1.8",
+		"eslint-plugin-svelte": "^3.23.0",
+		"globals": "^17.12.0",
+		"magic-string": "^0.30.21",
+		"mdsvex": "0.12.8",
+		"prettier": "^3.9.6",
+		"prettier-plugin-svelte": "^4.1.1",
+		"rollup-plugin-visualizer": "^7.1.1",
+		"shiki": "^4.3.1",
+		"svelte": "5.57.2",
+		"svelte-check": "4.7.6",
+		"tailwindcss": "^4.3.3",
+		"typescript": "7.0.2",
+		"typescript-eslint": "^8.71.1",
+		"vite": "8.3.3",
+		"vitest": "5.0.3"
+	}
+}

@@ -1,0 +1,179 @@
+name: check
+
+# TIN-7477. Offline checks: payload immutability, SHA256SUMS and the tree
+# rules, action pins, and the tool tests. Reads no npm and no nodejs.org.
+#
+# Posts the commit status `bazel-payloads/check`, and only that context. It
+# never posts `bazel-payloads/reproduce`: reproduce.yml alone posts it, also
+# for a PR that adds no payload file (PR-P1 review A1).
+#
+# A payload PR opened by publish.yml triggers no workflow, so a reviewer
+# dispatches this from main with the PR number.
+#
+#   tree    main's tools (on pull_request, the base commit's; on push, the
+#           pushed main commit's). The head is fetched and read as data only:
+#           `git diff`, `git show`, `git ls-tree` and `git archive`. No head
+#           code runs in this job, so the head sha it outputs is trusted.
+#   test    the head's own tool tests through the head's flake, with a
+#           read-only token. Head code runs here and nowhere else.
+#   report  runs no code from the repository. It posts success only when
+#           both jobs succeeded.
+#
+# Residual risk: a same-repository pull_request run uses the head's copy of
+# this file, so a writer can post any context with it. Statuses alone never
+# stop a writer; the ruleset proposal in the README (integration_id 15368,
+# code-owner review with last-push approval) covers that.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to check (a payload PR or any other PR without a pull_request run)"
+        required: true
+        type: number
+
+permissions: {}
+
+jobs:
+  tree:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head: ${{ steps.target.outputs.head }}
+    env:
+      GIT_NO_REPLACE_OBJECTS: "1"
+    steps:
+      # Tools come from main (dispatch is guarded to refs/heads/main below),
+      # the PR base on pull_request, or the pushed main commit on push.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Resolve the commit under check (as data)
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_INPUT: ${{ inputs.pr }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request)
+              [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "bad PR number"; exit 1; }
+              head="$PR_HEAD"; base="$PR_BASE"; number="$PR_NUMBER" ;;
+            workflow_dispatch)
+              [ "$GITHUB_REF" = refs/heads/main ] || { echo "dispatch from main only"; exit 1; }
+              [[ "$PR_INPUT" =~ ^[0-9]+$ ]] || { echo "bad PR number"; exit 1; }
+              pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_INPUT")
+              [ "$(jq -r .head.repo.full_name <<<"$pr")" = "$GITHUB_REPOSITORY" ] || { echo "fork heads are not checked by dispatch"; exit 1; }
+              [ "$(jq -r .base.ref <<<"$pr")" = main ] || { echo "PR is not into main"; exit 1; }
+              head=$(jq -r .head.sha <<<"$pr"); base=$(jq -r .base.sha <<<"$pr"); number="$PR_INPUT" ;;
+            push)
+              head="$GITHUB_SHA"; base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"; number="" ;;
+            *)
+              echo "unexpected event $EVENT"; exit 1 ;;
+          esac
+          [[ "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ ]] || { echo "bad head or base sha"; exit 1; }
+          if [ -n "$number" ]; then
+            git fetch --no-tags --quiet origin "+refs/pull/$number/head:refs/remotes/pr/head"
+            [ "$(git rev-parse refs/remotes/pr/head)" = "$head" ] || { echo "PR head moved"; exit 1; }
+          fi
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Payload immutability, SHA256SUMS and tree rules (main's tools, head as data)
+        env:
+          BASE: ${{ steps.target.outputs.base }}
+          HEAD_SHA: ${{ steps.target.outputs.head }}
+        run: |
+          set -euo pipefail
+          mb=$(git merge-base "$BASE" "$HEAD_SHA")
+          if [ -f tools/payloads.py ] && [ -f flake.nix ]; then
+            nix develop -c python3 -I tools/payloads.py tree --base "$mb" --head "$HEAD_SHA"
+          else
+            # Bootstrap only: the base is the initial commit, which carries no
+            # tools (PR-P1 itself, on pull_request). Nothing is published yet,
+            # so the rule is that the change adds no payload path at all.
+            echo "bootstrap: the base carries no tools; refusing every payload path"
+            git diff --no-renames --name-only -z "$mb...$HEAD_SHA" > "$RUNNER_TEMP/changed"
+            if tr '\0' '\n' < "$RUNNER_TEMP/changed" | grep -qE '^(payloads/|node/|attestations/|receipts/|SHA256SUMS$)'; then
+              echo "a bootstrap change must not touch a payload path"; exit 1
+            fi
+          fi
+      - name: Every action pinned by full sha (main's tools, head's workflows as data)
+        env:
+          HEAD_SHA: ${{ steps.target.outputs.head }}
+        run: |
+          set -euo pipefail
+          [ -f tools/payloads.py ] || { echo "bootstrap: pins run in the test job only"; exit 0; }
+          d="$RUNNER_TEMP/head-workflows"
+          mkdir -p "$d"
+          git archive --format=tar "$HEAD_SHA" .github/workflows > "$RUNNER_TEMP/head-workflows.tar"
+          tar -x -f "$RUNNER_TEMP/head-workflows.tar" -C "$d" --no-same-owner --no-same-permissions
+          nix develop -c python3 -I tools/payloads.py pins --root "$d"
+
+  test:
+    needs: tree
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check out the head under test
+        env:
+          HEAD_SHA: ${{ needs.tree.outputs.head }}
+          PR_NUMBER: ${{ inputs.pr || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "no head sha"; exit 1; }
+          if [ -n "$PR_NUMBER" ]; then
+            [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "bad PR number"; exit 1; }
+            git fetch --no-tags --quiet origin "+refs/pull/$PR_NUMBER/head:refs/remotes/pr/head"
+          fi
+          git checkout --quiet --detach "$HEAD_SHA"
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Tool tests (the head's own)
+        run: nix develop -c python3 -I tools/test_payloads.py
+      - name: Pin lint (the head's own; the tree job runs main's)
+        run: nix develop -c python3 -I tools/payloads.py pins --root .
+
+  report:
+    needs: [tree, test]
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - name: Post bazel-payloads/check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TREE: ${{ needs.tree.result }}
+          TEST: ${{ needs.test.result }}
+          # The tree job runs no head code. The fallbacks are event fields,
+          # never a job output; a dispatch without a resolved head posts nothing.
+          HEAD_SHA: ${{ needs.tree.outputs.head || github.event.pull_request.head.sha || (github.event_name == 'push' && github.sha) || '' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "no head sha"; exit 1; }
+          if [ "$TREE" = success ] && [ "$TEST" = success ]; then
+            state=success; desc="tree rules, SHA256SUMS, pins (main's tools) and tool tests"
+          else
+            state=failure; desc="tree: $TREE, test: $TEST"
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" -f state="$state" -f context=bazel-payloads/check -f description="$desc" -f target_url="$RUN_URL" > /dev/null

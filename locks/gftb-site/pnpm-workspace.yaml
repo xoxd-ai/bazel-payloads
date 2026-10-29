@@ -1,0 +1,31 @@
+packages:
+  - .
+
+overrides:
+  # Only the vulnerable pre-0.7 line is lifted; SvelteKit 3 needs cookie 1.x.
+  'cookie@<0.7.0': 0.7.2
+  fast-uri: 3.1.2
+
+# RU13/RU13b TypeScript 7 patch set, copied from xoxd-ai/site.scaffold main
+# (patches/README.md). site.scaffold keeps these settings in the package.json
+# `pnpm` field; this repository keeps every pnpm setting in this file.
+packageExtensions:
+  '@sveltejs/kit@3.0.1':
+    peerDependencies:
+      '@typescript/typescript6': ^6.0.0
+    peerDependenciesMeta:
+      '@typescript/typescript6':
+        optional: true
+
+peerDependencyRules:
+  allowedVersions:
+    '@sveltejs/kit>typescript': '7'
+
+patchedDependencies:
+  '@sveltejs/kit@3.0.1': patches/@sveltejs__kit@3.0.1.patch
+  devalue@5.9.4: patches/devalue@5.9.4.patch
+  svelte-check@4.7.6: patches/svelte-check@4.7.6.patch
+
+onlyBuiltDependencies:
+  - '@tailwindcss/oxide'
+  - esbuild

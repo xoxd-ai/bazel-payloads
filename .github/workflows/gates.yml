@@ -1,0 +1,80 @@
+name: gates
+
+# TIN-7477, R575 design section 7: gates P-H and P-E, which must pass before
+# PR-P1 merges. They are one-time evidence, not required checks.
+#
+# P-H  a no-op GitHub-hosted ubuntu-24.04 job, then a provenance attestation of
+#      a fixed file that `gh attestation verify` must accept. TIN-3914 records
+#      hosted jobs aborting for a billing lock in other xoxd-ai repositories;
+#      if P-H aborts here too, STOP and ask the operator (decision D6).
+# P-E  HEAD requests from the tinyland-nix ARC class to registry.npmjs.org and
+#      nodejs.org, which reproduce.yml needs. workflow_dispatch from main only
+#      (PR-P1 review A2): no legitimate run ever executes a PR-supplied
+#      definition on the self-hosted class. It therefore runs after this file
+#      reaches main, and before the first payload PR can merge (that PR's
+#      required `bazel-payloads/reproduce` needs the same class anyway).
+#
+# The `if:` guards below hold only for this file as main carries it. A fork
+# PR's pull_request run uses the fork's copy of every workflow, so the guard
+# against forks on the self-hosted class is the repository settings, in this
+# order (README, "Operator preconditions"): first the fork-PR approval policy
+# `all_external_contributors`, and only then a runner group that admits this
+# repository, preferably one used by it alone.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  p-h-hosted:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Hosted runner starts
+        run: |
+          echo "P-H: hosted ubuntu-24.04 job ran (${RUNNER_OS}/${RUNNER_ARCH}, ${RUNNER_ENVIRONMENT})"
+
+  p-h-attest:
+    needs: p-h-hosted
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: tools/fixtures/p-h.txt
+      - name: Verify the attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation verify tools/fixtures/p-h.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/gates.yml"
+
+  p-e-egress:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: tinyland-nix
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: HEAD registry.npmjs.org and nodejs.org
+        run: |
+          set -euo pipefail
+          for u in \
+            https://registry.npmjs.org/eslint/-/eslint-10.10.0.tgz \
+            https://nodejs.org/dist/v22.22.0/SHASUMS256.txt; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -I --max-time 30 "$u")
+            echo "P-E: $code $u"
+            [ "$code" = 200 ] || exit 1
+          done
