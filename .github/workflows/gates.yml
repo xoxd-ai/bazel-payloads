@@ -8,11 +8,18 @@ name: gates
 #      hosted jobs aborting for a billing lock in other xoxd-ai repositories;
 #      if P-H aborts here too, STOP and ask the operator (decision D6).
 # P-E  HEAD requests from the tinyland-nix ARC class to registry.npmjs.org and
-#      nodejs.org, which reproduce.yml needs. It queues until the operator adds
-#      xoxd-ai/bazel-payloads to an ARC runner group that admits public
-#      repositories; its timeout bounds the run once a runner picks it up.
+#      nodejs.org, which reproduce.yml needs. workflow_dispatch from main only
+#      (PR-P1 review A2): no legitimate run ever executes a PR-supplied
+#      definition on the self-hosted class. It therefore runs after this file
+#      reaches main, and before the first payload PR can merge (that PR's
+#      required `bazel-payloads/reproduce` needs the same class anyway).
 #
-# Same-repository PRs only: a fork PR never reaches the self-hosted class.
+# The `if:` guards below hold only for this file as main carries it. A fork
+# PR's pull_request run uses the fork's copy of every workflow, so the guard
+# against forks on the self-hosted class is the repository settings, in this
+# order (README, "Operator preconditions"): first the fork-PR approval policy
+# `all_external_contributors`, and only then a runner group that admits this
+# repository, preferably one used by it alone.
 
 on:
   pull_request:
@@ -56,7 +63,7 @@ jobs:
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/gates.yml"
 
   p-e-egress:
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: tinyland-nix
     timeout-minutes: 10
     permissions: {}

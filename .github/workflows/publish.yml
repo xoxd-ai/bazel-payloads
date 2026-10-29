@@ -14,6 +14,13 @@ name: publish
 # attest and propose run only on a workflow_dispatch from refs/heads/main with
 # publish=true (C3.2). A dispatch with publish=false is a dry run: fetch and
 # pack, then a job artifact, nothing else.
+#
+# The `if:` guard is advisory against a writer: a dispatch from another branch
+# runs that branch's copy of this file. The server-side guard is the `publish`
+# environment on attest and propose, whose deployment branch policy the
+# operator sets to `main` (README, "Operator preconditions"). Provenance
+# verification with `--source-ref refs/heads/main` and reproduce.yml still
+# catch anything published from elsewhere (PR-P1 review S4).
 
 on:
   workflow_dispatch:
@@ -117,6 +124,7 @@ jobs:
   attest:
     needs: fetch-pack
     if: github.ref == 'refs/heads/main' && inputs.publish
+    environment: publish
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -151,6 +159,7 @@ jobs:
   propose:
     needs: attest
     if: github.ref == 'refs/heads/main' && inputs.publish
+    environment: publish
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -192,9 +201,9 @@ jobs:
             echo
             echo "Reviewer checklist:"
             echo
-            echo "- [ ] \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY} --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/publish.yml --source-ref refs/heads/main\` passes for every new archive."
+            echo "- [ ] \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY} --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/publish.yml --source-ref refs/heads/main --deny-self-hosted-runners\` passes for every new archive."
             echo "- [ ] Each bundle MANIFEST's sha512 set equals the P0 lock's entries for that bundle, and \`p0_lock_sha256\` equals the lock."
-            echo "- [ ] \`bazel-payloads/reproduce\` names a runner class other than ubuntu-24.04."
+            echo "- [ ] \`bazel-payloads/reproduce\` is success and names \`tinyland-nix\`."
             echo
             echo "New files (sha256):"
             echo
