@@ -49,6 +49,10 @@ NODE_HOST = "nodejs.org"
 PAYLOAD_ROOTS = ("payloads/", "node/")
 PR_ONLY_ROOTS = PAYLOAD_ROOTS + ("attestations/", "receipts/")
 SUMS = "SHA256SUMS"
+LOCKS_ROOT = "locks/"
+PLANS_ROOT = "plans/"
+# Payload-root paths are plain ASCII (PR-R1's consumer regex is ASCII only).
+SAFE_PAYLOAD_PATH = re.compile(r"[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*")
 
 
 class PayloadError(Exception):
@@ -181,6 +185,8 @@ def lock_closure(lock_path, importer, direct):
         url = res.get("tarball") or npm_url(name, bare(ver))
         if urllib.parse.urlsplit(url).netloc != NPM_HOST:
             fail(f"{pkg_key}: tarball host is not {NPM_HOST}")
+        if meta.get("libc"):
+            fail(f"{pkg_key}: a libc field; plan platforms name no libc yet (a P2 decision)")
         rows[pkg_key] = (name, bare(ver), integrity, url, meta.get("os") or [], meta.get("cpu") or [])
         for section in ("dependencies", "optionalDependencies"):
             for dname, dval in (snap.get(section) or {}).items():
@@ -206,11 +212,31 @@ def bundle_closure(plan):
     return rows, lock_plan
 
 
+def platform_ok(value, allowed):
+    """npm's os/cpu rule (npm-install-checks `checkList`).
+
+    An empty list or ["any"] admits every value. A negated entry `!x` refuses
+    x. Otherwise the value must equal a positive entry, unless every entry is
+    negated. One field alone restricts only that field.
+    """
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    if list(allowed) == ["any"]:
+        return True
+    negated, match = 0, False
+    for entry in allowed:
+        if entry.startswith("!"):
+            negated += 1
+            if value == entry[1:]:
+                return False
+        elif value == entry:
+            match = True
+    return match or negated == len(allowed)
+
+
 def is_full(plan, row):
     os_list, cpu_list = row[4], row[5]
-    if not os_list and not cpu_list:
-        return True
-    return any(p["os"] in os_list and p["cpu"] in cpu_list for p in plan["full_platforms"])
+    return any(platform_ok(p["os"], os_list) and platform_ok(p["cpu"], cpu_list) for p in plan["full_platforms"])
 
 
 # ---------------------------------------------------------------- fetch
@@ -602,19 +628,70 @@ def sums(root, check):
 # ---------------------------------------------------------------- tree rules
 
 
+def git_env():
+    # Replace refs never change what a check reads (PR-P1 review A1).
+    return {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
+
+
+def git_raw(*args):
+    return subprocess.run(["git", *args], check=True, capture_output=True, env=git_env()).stdout
+
+
 def git(*args):
-    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+    return git_raw(*args).decode()
+
+
+def nul_fields(raw):
+    """Split `-z` output. Paths are exact bytes: no quoting (PR-P1 review S6)."""
+    parts = raw.split(b"\0")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    return [p.decode("utf-8", "surrogateescape") for p in parts]
+
+
+def diff_changes(base, head):
+    """(status, path) for every change between the merge base and head, from `git diff -z`."""
+    fields = nul_fields(git_raw("diff", "--no-renames", "--name-status", "-z", f"{base}...{head}"))
+    if len(fields) % 2:
+        fail("git diff --name-status -z: unexpected output")
+    return [(fields[i], fields[i + 1]) for i in range(0, len(fields), 2)]
+
+
+def tree_files(rev):
+    return nul_fields(git_raw("ls-tree", "-r", "-z", "--name-only", rev))
+
+
+def published_plan(base, path):
+    """True when the plan file at `base` names payload paths that exist at `base`."""
+    try:
+        plan = json.loads(git_raw("show", f"{base}:{path}"))
+    except (subprocess.CalledProcessError, ValueError):
+        return False
+    if not isinstance(plan, dict) or not all(k in plan for k in ("kind", "module", "version")):
+        return False
+    if plan["kind"] == "node" and not isinstance(plan.get("files"), dict):
+        return False
+    present = set(tree_files(base))
+    return any(rel in present for rel in payload_paths(plan).values())
 
 
 def tree_rules(base, head, payload_pr):
-    """Payload files are add-only, SHA256SUMS is append-only, and payload PRs touch nothing else."""
-    changes = []
-    for line in git("diff", "--no-renames", "--name-status", f"{base}...{head}").splitlines():
-        status, path = line.split("\t", 1)
-        changes.append((status, path))
+    """Payload files are add-only, SHA256SUMS is append-only, and payload PRs touch nothing else.
+
+    Lock directories are add-only and a published plan never changes, so every
+    published payload stays reproducible from main (PR-P1 review S3).
+    """
+    changes = diff_changes(base, head)
+    lock_dirs = {p.split("/")[1] for p in tree_files(base) if p.startswith(LOCKS_ROOT) and p.count("/") >= 2}
     for status, path in changes:
         if path.startswith(PR_ONLY_ROOTS) and status != "A":
             fail(f"{path}: published payload files are immutable ({status})")
+        if path.startswith(PR_ONLY_ROOTS) and not SAFE_PAYLOAD_PATH.fullmatch(path):
+            fail(f"{path!r}: payload paths are plain ASCII")
+        if path.startswith(LOCKS_ROOT) and (status != "A" or path.split("/")[1] in lock_dirs):
+            fail(f"{path}: a merged lock directory is immutable ({status}); a lock bump adds a new locks/<lock plan name>/")
+        if path.startswith(PLANS_ROOT) and status != "A" and published_plan(base, path):
+            fail(f"{path}: a published plan is immutable ({status}); add a new plan version")
     touched_payload = any(p.startswith(PR_ONLY_ROOTS) or p == SUMS for _, p in changes)
     other = [p for _, p in changes if not (p.startswith(PR_ONLY_ROOTS) or p == SUMS)]
     if touched_payload and other:
@@ -623,10 +700,9 @@ def tree_rules(base, head, payload_pr):
         fail("a payload PR adds no payload file")
 
     def sums_at(rev):
-        try:
-            return git("show", f"{rev}:{SUMS}").splitlines()
-        except subprocess.CalledProcessError:
+        if SUMS not in tree_files(rev):
             return []
+        return git("cat-file", "blob", f"{rev}:{SUMS}").splitlines()
 
     old, new = sums_at(base), sums_at(head)
     if not set(old) <= set(new):
@@ -639,11 +715,11 @@ def tree_rules(base, head, payload_pr):
         listed[rel] = digest
     if new != sorted(new, key=lambda ln: ln.split("  ", 1)[1]):
         fail(f"{SUMS} is not sorted by path")
-    files = [p for p in git("ls-tree", "-r", "--name-only", head).splitlines() if p.startswith(PAYLOAD_ROOTS)]
+    files = [p for p in tree_files(head) if p.startswith(PAYLOAD_ROOTS)]
     if sorted(files) != sorted(listed):
         fail(f"{SUMS} at head does not list exactly the files under {', '.join(PAYLOAD_ROOTS)}")
     for rel in files:
-        blob = subprocess.run(["git", "show", f"{head}:{rel}"], check=True, capture_output=True).stdout
+        blob = git_raw("cat-file", "blob", f"{head}:{rel}")
         if sha256_hex(blob) != listed[rel]:
             fail(f"{rel}: sha256 does not match {SUMS}")
 
@@ -711,7 +787,7 @@ def main(argv=None):
             tree_rules(a.base, a.head, a.payload_pr)
         elif a.cmd == "pins":
             pins(a.root)
-    except PayloadError as exc:
+    except (PayloadError, subprocess.CalledProcessError) as exc:
         print(f"payloads.py: {exc}", file=sys.stderr)
         return 1
     return 0

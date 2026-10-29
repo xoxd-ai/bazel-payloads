@@ -7,6 +7,7 @@ import gzip
 import io
 import json
 import os
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -17,6 +18,7 @@ sys.path.insert(0, HERE)
 
 import hopcheck  # noqa: E402
 import payloads  # noqa: E402
+import reproduce  # noqa: E402
 
 ROOT = os.path.dirname(HERE)
 
@@ -166,6 +168,161 @@ class Lock(unittest.TestCase):
         b, mb = payloads.pack_lock(plan)
         self.assertEqual((a, ma), (b, mb))
         self.assertEqual(json.loads(ma)["files"]["pnpm-lock.yaml"], plan["lock_sha256"])
+
+
+class Platforms(unittest.TestCase):
+    """npm's os/cpu rule (PR-P1 review S9)."""
+
+    PLAN = {"full_platforms": [{"os": "linux", "cpu": "x64"}, {"os": "darwin", "cpu": "arm64"}]}
+
+    def full(self, os_list, cpu_list):
+        return payloads.is_full(self.PLAN, ("a", "1.0.0", "sha512-x", "u", os_list, cpu_list))
+
+    def test_rule(self):
+        self.assertTrue(payloads.platform_ok("linux", []))
+        self.assertTrue(payloads.platform_ok("linux", ["any"]))
+        self.assertTrue(payloads.platform_ok("linux", "linux"))
+        self.assertTrue(payloads.platform_ok("linux", ["!win32"]))
+        self.assertFalse(payloads.platform_ok("win32", ["!win32"]))
+        self.assertFalse(payloads.platform_ok("linux", ["darwin"]))
+        self.assertFalse(payloads.platform_ok("linux", ["linux", "!linux"]))
+        self.assertTrue(payloads.platform_ok("linux", ["darwin", "linux"]))
+
+    def test_is_full(self):
+        self.assertTrue(self.full([], []))
+        self.assertTrue(self.full(["linux"], ["x64"]))
+        self.assertTrue(self.full(["darwin"], []), "os alone restricts only os")
+        self.assertTrue(self.full([], ["arm64"]), "cpu alone restricts only cpu")
+        self.assertFalse(self.full([], ["ia32"]))
+        self.assertTrue(self.full(["!win32"], []), "fsevents-style negation")
+        self.assertFalse(self.full(["!linux", "!darwin"], []))
+        self.assertFalse(self.full(["linux"], ["arm64"]))
+        self.assertFalse(self.full(["win32"], ["x64"]))
+
+
+class Tree(unittest.TestCase):
+    """tree_rules from main's tools against a scratch repository (PR-P1 review A1, S3, S6)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.old = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.addCleanup(os.chdir, self.old)
+        self.git("init", "-q", "-b", "main")
+        self.write("README.md", b"x\n")
+        self.write("locks/l/pnpm-lock.yaml", b"lock\n")
+        self.write("plans/p-1.0.0.json", json.dumps({"kind": "npm-lock", "module": "p", "version": "1.0.0"}).encode())
+        self.write("plans/q-1.0.0.json", json.dumps({"kind": "npm-lock", "module": "q", "version": "1.0.0"}).encode())
+        self.publish("payloads/p/1.0.0/p-1.0.0.tar.gz", b"tgz")
+        self.base = self.commit()
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", *args],
+            check=True,
+            capture_output=True,
+        ).stdout
+
+    def write(self, rel, data):
+        os.makedirs(os.path.dirname(rel) or ".", exist_ok=True)
+        with open(rel, "wb") as f:
+            f.write(data)
+
+    def publish(self, rel, data):
+        self.write(rel, data)
+        payloads.sums(".", check=False)
+
+    def commit(self):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", "c")
+        return self.git("rev-parse", "HEAD").decode().strip()
+
+    def refused(self, needle, payload_pr=False):
+        head = self.commit()
+        with self.assertRaises(payloads.PayloadError) as cm:
+            payloads.tree_rules(self.base, head, payload_pr)
+        self.assertIn(needle, str(cm.exception))
+
+    def test_tools_change_passes(self):
+        self.write("README.md", b"y\n")
+        payloads.tree_rules(self.base, self.commit(), False)
+
+    def test_payload_add_passes(self):
+        self.publish("payloads/q/1.0.0/q-1.0.0.tar.gz", b"q")
+        payloads.tree_rules(self.base, self.commit(), True)
+
+    def test_published_file_is_immutable(self):
+        self.publish("payloads/p/1.0.0/p-1.0.0.tar.gz", b"other")
+        self.refused("immutable")
+
+    def test_non_ascii_payload_path_is_seen_and_refused(self):
+        self.publish("payloads/q/1.0.0/\u00e9.tar.gz", b"q")
+        self.refused("plain ASCII", payload_pr=True)
+
+    def test_merged_lock_directory_is_immutable(self):
+        self.write("locks/l/pnpm-lock.yaml", b"bumped\n")
+        self.refused("lock directory is immutable")
+
+    def test_no_new_file_in_a_merged_lock_directory(self):
+        self.write("locks/l/patches/x.patch", b"x\n")
+        self.refused("lock directory is immutable")
+
+    def test_new_lock_directory_passes(self):
+        self.write("locks/l2/pnpm-lock.yaml", b"lock2\n")
+        payloads.tree_rules(self.base, self.commit(), False)
+
+    def test_published_plan_is_immutable(self):
+        self.write("plans/p-1.0.0.json", b"{}")
+        self.refused("published plan is immutable")
+
+    def test_unpublished_plan_may_change(self):
+        self.write("plans/q-1.0.0.json", json.dumps({"kind": "npm-lock", "module": "q", "version": "1.0.0", "x": 1}).encode())
+        payloads.tree_rules(self.base, self.commit(), False)
+
+    def test_replace_ref_does_not_hide_a_payload(self):
+        self.publish("payloads/q/1.0.0/q-1.0.0.tar.gz", b"q")
+        self.write("README.md", b"mixed\n")
+        head = self.commit()
+        self.git("replace", head, self.base)
+        with self.assertRaises(payloads.PayloadError) as cm:
+            payloads.tree_rules(self.base, head, False)
+        self.assertIn("must not also change", str(cm.exception))
+
+
+class BotCommit(unittest.TestCase):
+    """reproduce.py's commit identity check (PR-P1 review S2)."""
+
+    GOOD = {
+        "sha": "0" * 40,
+        "author": {"login": "github-actions[bot]"},
+        "committer": {"login": "web-flow"},
+        "commit": {"committer": {"email": "noreply@github.com"}, "verification": {"verified": True, "reason": "valid"}},
+    }
+
+    def variant(self, **patch):
+        c = json.loads(json.dumps(self.GOOD))
+        for path, value in patch.items():
+            node = c
+            keys = path.split("__")
+            for k in keys[:-1]:
+                node = node[k]
+            node[keys[-1]] = value
+        return c
+
+    def test_good(self):
+        self.assertIsNone(reproduce.bot_commit_problem(self.GOOD))
+
+    def test_spoofed_author_signed_by_a_person(self):
+        c = self.variant(committer__login="Jesssullivan", commit__committer__email="bot@users.noreply.github.com")
+        self.assertIn("committer", reproduce.bot_commit_problem(c))
+
+    def test_other_refusals(self):
+        self.assertIn("author", reproduce.bot_commit_problem(self.variant(author__login="someone")))
+        self.assertIn("committer", reproduce.bot_commit_problem(self.variant(commit__committer__email="x@example.invalid")))
+        self.assertIn("signature", reproduce.bot_commit_problem(self.variant(commit__verification__verified=False)))
+        self.assertIn("signature", reproduce.bot_commit_problem(self.variant(commit__verification__reason="unsigned")))
+        self.assertIsNotNone(reproduce.bot_commit_problem({}))
 
 
 class Bin(unittest.TestCase):

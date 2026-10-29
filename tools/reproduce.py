@@ -24,10 +24,32 @@ import payloads  # noqa: E402
 
 CONTEXT = "bazel-payloads/reproduce"
 BOT_LOGIN = "github-actions[bot]"
+# A commit GitHub creates and signs through the API is committed by GitHub
+# itself. A person can set the author email to the bot's noreply address and
+# sign with their own key, so the author alone proves nothing (PR-P1 review
+# S2). This is defense in depth: byte equality is the guard.
+GITHUB_COMMITTER_LOGIN = "web-flow"
+GITHUB_COMMITTER_EMAIL = "noreply@github.com"
 
 
 def git_bytes(*args):
-    return subprocess.run(["git", *args], check=True, capture_output=True).stdout
+    return payloads.git_raw(*args)
+
+
+def bot_commit_problem(c):
+    """None when a compare-API commit is a GitHub-signed github-actions[bot] commit, else the reason."""
+    author = (c.get("author") or {}).get("login")
+    committer = (c.get("committer") or {}).get("login")
+    detail = c.get("commit") or {}
+    email = (detail.get("committer") or {}).get("email")
+    v = detail.get("verification") or {}
+    if author != BOT_LOGIN:
+        return f"author is {author!r}, not {BOT_LOGIN}"
+    if committer != GITHUB_COMMITTER_LOGIN or email != GITHUB_COMMITTER_EMAIL:
+        return f"committer is {committer!r} <{email}>, not GitHub ({GITHUB_COMMITTER_LOGIN}, {GITHUB_COMMITTER_EMAIL})"
+    if v.get("verified") is not True or v.get("reason") != "valid":
+        return f"signature is not verified as valid ({v.get('reason')!r})"
+    return None
 
 
 def plan_for(path):
@@ -56,12 +78,7 @@ def resolve_pr(number):
 
 
 def added_payload_files(base, head):
-    out = []
-    for line in git_bytes("diff", "--no-renames", "--name-status", f"{base}...{head}").decode().splitlines():
-        status, path = line.split("\t", 1)
-        if status == "A" and path.startswith(payloads.PAYLOAD_ROOTS):
-            out.append(path)
-    return sorted(out)
+    return sorted(p for status, p in payloads.diff_changes(base, head) if status == "A" and p.startswith(payloads.PAYLOAD_ROOTS))
 
 
 def reproduce(files, head, work):
@@ -97,9 +114,7 @@ def main(argv=None):
         if a.main:
             head = git_bytes("rev-parse", "HEAD").decode().strip()
             github_api.set_status(head, CONTEXT, "pending", f"reproducing main on {a.runner_class}", run_url)
-            files = sorted(
-                p for p in git_bytes("ls-tree", "-r", "--name-only", head).decode().splitlines() if p.startswith(payloads.PAYLOAD_ROOTS)
-            )
+            files = sorted(p for p in payloads.tree_files(head) if p.startswith(payloads.PAYLOAD_ROOTS))
             payloads.sums(".", check=True)
             if not files:
                 github_api.set_status(head, CONTEXT, "success", "main carries no payload yet", run_url)
@@ -114,19 +129,22 @@ def main(argv=None):
                 return 0
             if not pr["head"]["ref"].startswith("payload/"):
                 payloads.fail("payload files arrive only on payload/ branches opened by publish.yml")
+            if not commits:
+                payloads.fail("the compare API lists no commit for this PR")
             for c in commits:
-                login = (c.get("author") or {}).get("login")
-                if login != BOT_LOGIN or not c["commit"]["verification"]["verified"]:
-                    payloads.fail(f"commit {c['sha'][:12]} is not a verified {BOT_LOGIN} commit")
+                problem = bot_commit_problem(c)
+                if problem:
+                    payloads.fail(f"commit {str(c.get('sha'))[:12]}: {problem}")
         names = reproduce(files, head, a.work)
         msg = f"{len(files)} files byte-equal ({', '.join(names)}) on {a.runner_class}"
         github_api.set_status(head, CONTEXT, "success", msg, run_url)
         print(json.dumps({"head": head, "plans": names, "files": files, "runner_class": a.runner_class}))
         return 0
-    except (payloads.PayloadError, subprocess.CalledProcessError, github_api.ApiError) as exc:
-        print(f"reproduce.py: {exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - any crash posts failure, never a silent pending (S5)
+        kind = "" if isinstance(exc, (payloads.PayloadError, subprocess.CalledProcessError, github_api.ApiError)) else f"{type(exc).__name__}: "
+        print(f"reproduce.py: {kind}{exc}", file=sys.stderr)
         if head:
-            github_api.set_status(head, CONTEXT, "failure", str(exc)[:140], run_url)
+            github_api.set_status(head, CONTEXT, "failure", f"{kind}{exc}"[:140], run_url)
         return 1
 
 

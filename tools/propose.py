@@ -78,11 +78,16 @@ def main(argv=None):
         payloads.fail(f"commit {commit['sha']} is not GitHub-verified; refusing to create {a.branch}")
     github_api.call("POST", f"/repos/{repo}/git/refs", {"ref": f"refs/heads/{a.branch}", "sha": commit["sha"]})
     body = payloads.read_text(a.body)
-    pr = github_api.call(
-        "POST",
-        f"/repos/{repo}/pulls",
-        {"title": title, "head": a.branch, "base": "main", "body": body, "maintainer_can_modify": False},
-    )
+    try:
+        pr = github_api.call(
+            "POST",
+            f"/repos/{repo}/pulls",
+            {"title": title, "head": a.branch, "base": "main", "body": body, "maintainer_can_modify": False},
+        )
+    except github_api.ApiError as exc:
+        # With can_approve_pull_request_reviews false, GitHub refuses PR
+        # creation by GITHUB_TOKEN. The branch stays; a person opens the PR.
+        payloads.fail(f"{a.branch} is pushed at {commit['sha']}, but opening its PR failed ({exc}); open it by hand from that branch")
     print(json.dumps({"pr": pr["html_url"], "number": pr["number"], "head": commit["sha"], "files": len(tree)}))
     return 0
 
