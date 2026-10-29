@@ -1,0 +1,14 @@
+{
+ "base_url": "https://nodejs.org/dist/v22.22.0/",
+ "comment": "R576, R582: Node for linux-x64 (the cell) and darwin-arm64 (lab Macs). sha256 values are the rules_nodejs 6.7.3 table; fetch also checks them against the signed SHASUMS256.txt. linux-arm64 is not mirrored (no arm64 host in scope).",
+ "files": {
+  "node-v22.22.0-darwin-arm64.tar.gz": "5ed4db0fcf1eaf84d91ad12462631d73bf4576c1377e192d222e48026a902640",
+  "node-v22.22.0-linux-x64.tar.xz": "9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37"
+ },
+ "keys": "keys/node",
+ "kind": "node",
+ "module": "node",
+ "rules_nodejs": "6.7.3",
+ "signer": "CC68F5A3106FF448322E48ED27F5E38D5B0A215F",
+ "version": "22.22.0"
+}

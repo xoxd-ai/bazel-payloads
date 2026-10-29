@@ -1,0 +1,27 @@
+{
+ "closure_count": 160,
+ "closure_sha256": "5e1c5e1229faf4b3e59d0be2c39fb82e6199536d254e5ae368588e99cf04a62f",
+ "comment": "P1 (R575, R582): the //:lint_suite npm closure. Natives for platforms outside full_platforms keep package.json, README and LICENSE only.",
+ "direct": [
+  "@eslint/js",
+  "eslint",
+  "eslint-config-prettier",
+  "eslint-plugin-svelte",
+  "globals",
+  "prettier",
+  "prettier-plugin-svelte",
+  "svelte",
+  "typescript",
+  "typescript-eslint"
+ ],
+ "full_platforms": [
+  {"cpu": "x64", "os": "linux"},
+  {"cpu": "arm64", "os": "darwin"}
+ ],
+ "importer": ".",
+ "kind": "npm-bundle",
+ "lock_plan": "xoxd_npm_gftb_site_lock-1.0.0",
+ "module": "xoxd_npm_gftb_site_lint",
+ "rules_js": "2.9.1",
+ "version": "1.0.0"
+}

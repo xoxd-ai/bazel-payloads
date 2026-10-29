@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # GloriousFlywheel ARC pool (TIN-3914); see reproduce.yml and gates.yml.
+  labels:
+    - tinyland-nix

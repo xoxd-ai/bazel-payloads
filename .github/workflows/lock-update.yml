@@ -1,0 +1,42 @@
+name: lock-update
+
+# TIN-7477, R577, design section 3 step 1. Re-resolves locks/gftb-site with
+# the flake's pnpm 10.13.1 (`--lockfile-only --ignore-scripts`, so no package
+# code runs) and uploads the result as an artifact with its diff. It writes
+# nothing to the repository: a person commits the new lock in an ordinary
+# signed PR, which is reviewed like any lock bump. The plans that read the
+# lock (closure count and sha256) change in the same PR, and check.yml fails
+# until they agree.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  lock-update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: pnpm install --lockfile-only
+        working-directory: locks/gftb-site
+        run: nix develop ../..#lock-update -c pnpm install --lockfile-only --ignore-scripts
+      - name: Diff
+        run: |
+          set -euo pipefail
+          git diff --stat -- locks/gftb-site
+          mkdir -p "$RUNNER_TEMP/lock"
+          cp locks/gftb-site/pnpm-lock.yaml "$RUNNER_TEMP/lock/"
+          git diff -- locks/gftb-site > "$RUNNER_TEMP/lock/pnpm-lock.diff" || true
+          sha256sum "$RUNNER_TEMP/lock/pnpm-lock.yaml"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lock-update
+          path: ${{ runner.temp }}/lock
+          retention-days: 7

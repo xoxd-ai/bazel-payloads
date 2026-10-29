@@ -1,0 +1,79 @@
+name: reproduce
+
+# TIN-7477, R581 act eff34be5, design section 3 step 6, critique 2 N2.
+#
+# The independent reproduction. It runs on a different runner class from
+# publish.yml's ubuntu-24.04 fetch and pack: tinyland-nix (the GloriousFlywheel
+# ARC pool, the design's second infrastructure) by default, or GitHub-hosted
+# ubuntu-24.04-arm when the reviewer picks it. It always does its own fetch,
+# never reads another run's artifact, re-packs with main's tools and requires
+# every published file to be byte-equal. It posts `bazel-payloads/reproduce`
+# on the PR head (or on main for the weekly run).
+#
+# Triggers: workflow_dispatch from main with a PR number (payload PRs are
+# opened with GITHUB_TOKEN and trigger nothing), and a weekly run on main that
+# re-reads npm and nodejs.org on purpose, to catch an unpublish or a serving
+# change (C7). Never pull_request: the self-hosted class never runs a PR's
+# workflow file or a fork's code. The PR head is fetched as data only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to reproduce"
+        required: true
+        type: number
+      runner:
+        description: "Runner class (never the publish class, ubuntu-24.04)"
+        required: true
+        default: tinyland-nix
+        type: choice
+        options:
+          - tinyland-nix
+          - ubuntu-24.04-arm
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions: {}
+
+concurrency:
+  group: reproduce-${{ inputs.pr || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  reproduce:
+    # N2: `github.event.pull_request` is null on schedule and dispatch, so the
+    # guard names the events and the ref; the same-repository check on the PR
+    # head is done by tools/reproduce.py against the API.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ${{ inputs.runner || 'tinyland-nix' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Nix (GitHub-hosted class only; tinyland-nix bakes it in)
+        if: runner.environment == 'github-hosted'
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Reproduce
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ inputs.pr }}
+          RUNNER_CLASS: ${{ inputs.runner || 'tinyland-nix' }}
+        run: |
+          set -euo pipefail
+          [ "$RUNNER_CLASS" != ubuntu-24.04 ] || { echo "reproduce never runs on the publish runner class"; exit 1; }
+          if [ "$EVENT" = schedule ]; then
+            target=(--main)
+          else
+            [[ "$PR" =~ ^[0-9]+$ ]] || { echo "bad PR number"; exit 1; }
+            target=(--pr "$PR")
+          fi
+          nix develop -c python3 -I tools/reproduce.py "${target[@]}" --runner-class "$RUNNER_CLASS" --work "$RUNNER_TEMP/reproduce"
