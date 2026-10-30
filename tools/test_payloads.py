@@ -1,12 +1,14 @@
-"""Offline tests for tools/payloads.py and tools/hopcheck.py.
+"""Offline tests for tools/payloads.py, tools/propose.py and tools/hopcheck.py.
 
     nix develop -c python3 -I tools/test_payloads.py
 """
 
+import base64
 import gzip
 import io
 import json
 import os
+import random
 import subprocess
 import sys
 import tarfile
@@ -16,8 +18,10 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import github_api  # noqa: E402
 import hopcheck  # noqa: E402
 import payloads  # noqa: E402
+import propose  # noqa: E402
 import reproduce  # noqa: E402
 
 ROOT = os.path.dirname(HERE)
@@ -323,6 +327,216 @@ class BotCommit(unittest.TestCase):
         self.assertIn("signature", reproduce.bot_commit_problem(self.variant(commit__verification__verified=False)))
         self.assertIn("signature", reproduce.bot_commit_problem(self.variant(commit__verification__reason="unsigned")))
         self.assertIsNotNone(reproduce.bot_commit_problem({}))
+
+
+class FakeGitHub:
+    """The Git Data API calls propose.py makes, served from a local bare repository.
+
+    Like api.github.com, it refuses a request body over BODY_LIMIT with HTTP
+    422 "Sorry, your input was too large to process" (publish run 40988958431).
+    Every commit it creates reports `verified` as set by the test.
+    """
+
+    BODY_LIMIT = 1 << 20
+
+    def __init__(self, gitdir, repo):
+        self.gitdir = gitdir
+        self.repo = repo
+        self.verified = True
+        self.calls = []
+
+    def git(self, *args, stdin=None, env=None):
+        return subprocess.run(
+            ["git", f"--git-dir={self.gitdir}", *args],
+            check=True,
+            capture_output=True,
+            input=stdin,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", **(env or {})},
+        ).stdout.decode()
+
+    def call(self, method, path, body=None, raw_body=None, ok=(200, 201)):
+        data = raw_body if raw_body is not None else (json.dumps(body).encode() if body is not None else b"")
+        self.calls.append((method, path, len(data)))
+        if len(data) > self.BODY_LIMIT:
+            raise github_api.ApiError(method, path, 422, "Sorry, your input was too large to process.")
+        prefix = f"/repos/{self.repo}"
+        assert path.startswith(prefix), path
+        rest = path[len(prefix):]
+        if method == "GET" and rest == "/git/ref/heads/main":
+            return {"object": {"sha": self.git("rev-parse", "refs/heads/main").strip()}}
+        if method == "GET" and rest.startswith("/git/commits/"):
+            sha = rest.split("/")[-1]
+            return {"sha": sha, "tree": {"sha": self.git("rev-parse", f"{sha}^{{tree}}").strip()}}
+        if method == "GET" and rest.startswith("/git/trees/") and rest.endswith("?recursive=1"):
+            sha = rest[len("/git/trees/"):-len("?recursive=1")]
+            paths = [p.split("\t", 1)[1] for p in self.git("ls-tree", "-r", "-t", "-z", sha).split("\0") if p]
+            return {"truncated": False, "tree": [{"path": p} for p in paths]}
+        if method == "POST" and rest == "/git/blobs":
+            raise AssertionError("propose.py must not use the REST blob endpoint")
+        if method == "POST" and rest == "/git/trees":
+            with tempfile.TemporaryDirectory() as tmp:
+                env = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
+                self.git("read-tree", body["base_tree"], env=env)
+                info = b""
+                for e in body["tree"]:
+                    if self.git("cat-file", "-t", e["sha"]).strip() != "blob":
+                        raise github_api.ApiError(method, path, 422, "tree.sha is not a blob")
+                    info += f"{e['mode']} {e['sha']}\t{e['path']}".encode() + b"\0"
+                self.git("update-index", "-z", "--add", "--index-info", stdin=info, env=env)
+                return {"sha": self.git("write-tree", env=env).strip()}
+        if method == "POST" and rest == "/git/commits":
+            env = {k: "web-flow" for k in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME")}
+            env.update({k: "noreply@github.com" for k in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL")})
+            args = ["commit-tree", "--no-gpg-sign", "-m", body["message"], body["tree"]]
+            for parent in body["parents"]:
+                args += ["-p", parent]
+            sha = self.git(*args, env=env).strip()
+            return {"sha": sha, "verification": {"verified": self.verified}}
+        if method == "POST" and rest == "/git/refs":
+            self.git("update-ref", body["ref"], body["sha"], "0" * 40)
+            return {"ref": body["ref"]}
+        if method == "POST" and rest == "/pulls":
+            return {"html_url": f"https://github.invalid/{self.repo}/pull/2", "number": 2}
+        raise AssertionError(f"unexpected call {method} {path}")
+
+
+class Propose(unittest.TestCase):
+    """propose.py against a local remote: large files go up by git push, never as a REST blob body.
+
+    BAZEL_PAYLOADS_BIG=1 sizes the largest staged file like the 49.9 MB
+    darwin-arm64 Node archive of run 40988958431 (49923798 bytes).
+    """
+
+    REPO = "o/r"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.remote = os.path.join(self.tmp.name, "remote.git")
+        self.gh = FakeGitHub(self.remote, self.REPO)
+        self.gh.git("init", "-q", "--bare", "-b", "main")
+        with tempfile.TemporaryDirectory() as idx:
+            env = {"GIT_INDEX_FILE": os.path.join(idx, "index")}
+            readme = subprocess.run(
+                ["git", f"--git-dir={self.remote}", "hash-object", "-w", "--stdin"],
+                input=b"x\n", capture_output=True, check=True,
+            ).stdout.decode().strip()
+            self.gh.git("update-index", "--add", "--cacheinfo", f"100644,{readme},README.md", env=env)
+            tree = self.gh.git("write-tree", env=env).strip()
+        ident = {
+            f"GIT_{who}_{k}": v for who in ("AUTHOR", "COMMITTER") for k, v in (("NAME", "t"), ("EMAIL", "t@example.invalid"))
+        }
+        self.base = self.gh.git("commit-tree", "--no-gpg-sign", "-m", "base", tree, env=ident).strip()
+        self.gh.git("update-ref", "refs/heads/main", self.base)
+
+        big = 49923798 if os.environ.get("BAZEL_PAYLOADS_BIG") == "1" else 3 * self.gh.BODY_LIMIT
+        rnd = random.Random(7477)
+        self.files = {
+            "node/v1.0.0/node-v1.0.0-darwin-arm64.tar.gz": rnd.randbytes(big),
+            "node/v1.0.0/node-v1.0.0-linux-x64.tar.xz": rnd.randbytes(2 * self.gh.BODY_LIMIT),
+            "payloads/m/1.0.0/MANIFEST.json": b"{}\n",
+            "attestations/publish-1-1.sigstore.json": b"{}\n",
+            "receipts/publish-1-1.json": b"{}\n",
+            payloads.SUMS: b"sums\n",
+        }
+        self.staging = os.path.join(self.tmp.name, "staging")
+        for rel, data in self.files.items():
+            os.makedirs(os.path.join(self.staging, os.path.dirname(rel)), exist_ok=True)
+            with open(os.path.join(self.staging, rel), "wb") as f:
+                f.write(data)
+        self.body = os.path.join(self.tmp.name, "body.md")
+        with open(self.body, "w") as f:
+            f.write("Linear: TIN-7477\n")
+
+        for target, attr, value in (
+            (github_api, "call", self.gh.call),
+            (propose, "remote_url", lambda: "file://" + self.remote),
+        ):
+            old = getattr(target, attr)
+            setattr(target, attr, value)
+            self.addCleanup(setattr, target, attr, old)
+        old_repo = os.environ.get("GITHUB_REPOSITORY")
+        os.environ["GITHUB_REPOSITORY"] = self.REPO
+        self.addCleanup(lambda: os.environ.pop("GITHUB_REPOSITORY") if old_repo is None else os.environ.update(GITHUB_REPOSITORY=old_repo))
+
+    def run_propose(self):
+        argv = ["--base", self.base, "--staging", self.staging, "--branch", "payload/1-1", "--title", "payload: t", "--body", self.body]
+        out = io.StringIO()
+        old, sys.stdout = sys.stdout, out
+        try:
+            propose.main(argv)
+        finally:
+            sys.stdout = old
+        return json.loads(out.getvalue())
+
+    def refs(self, prefix):
+        return self.gh.git("for-each-ref", "--format=%(refname)", prefix).split()
+
+    def test_token_rides_in_an_env_header_only(self):
+        old = os.environ.get(github_api.TOKEN_ENV)
+        os.environ[github_api.TOKEN_ENV] = "t0ken"
+        try:
+            env = propose.git_env(self.tmp.name, "https://github.com/o/r.git")
+            local = propose.git_env(self.tmp.name, "file://" + self.remote)
+        finally:
+            if old is None:
+                os.environ.pop(github_api.TOKEN_ENV)
+            else:
+                os.environ[github_api.TOKEN_ENV] = old
+        self.assertEqual((env["GIT_CONFIG_COUNT"], env["GIT_CONFIG_KEY_0"]), ("1", "http.extraHeader"))
+        self.assertEqual(env["GIT_CONFIG_VALUE_0"], "AUTHORIZATION: basic " + base64.b64encode(b"x-access-token:t0ken").decode())
+        self.assertEqual((env["GIT_CONFIG_GLOBAL"], env["GIT_CONFIG_NOSYSTEM"]), (os.devnull, "1"))
+        self.assertEqual(local["GIT_CONFIG_COUNT"], "0")
+
+    def test_old_blob_body_is_refused(self):
+        """The fake reproduces the run 40988958431 failure for the old upload shape."""
+        data = self.files["node/v1.0.0/node-v1.0.0-darwin-arm64.tar.gz"]
+        raw = json.dumps({"encoding": "base64", "content": base64.b64encode(data).decode()}).encode()
+        with self.assertRaises(github_api.ApiError) as cm:
+            self.gh.call("POST", f"/repos/{self.REPO}/git/blobs", raw_body=raw)
+        self.assertEqual(cm.exception.status, 422)
+
+    def test_large_files_land_byte_equal_on_one_api_commit(self):
+        result = self.run_propose()
+        head = self.gh.git("rev-parse", "refs/heads/payload/1-1").strip()
+        self.assertEqual(result["head"], head)
+        self.assertEqual(result["files"], len(self.files))
+        self.assertEqual(self.gh.git("rev-list", "--parents", "-n", "1", head).split(), [head, self.base])
+        self.assertEqual(self.gh.git("log", "-1", "--format=%cn %ce", head).strip(), "web-flow noreply@github.com")
+        for rel, data in self.files.items():
+            got = subprocess.run(
+                ["git", f"--git-dir={self.remote}", "cat-file", "blob", f"{head}:{rel}"], capture_output=True, check=True
+            ).stdout
+            self.assertEqual(got, data, rel)
+        self.assertEqual(self.gh.git("cat-file", "blob", f"{head}:README.md"), "x\n")
+        self.assertNotIn("/git/blobs", [p.split(f"/repos/{self.REPO}")[1] for _, p, _ in self.gh.calls])
+        self.assertTrue(all(n <= self.gh.BODY_LIMIT for _, _, n in self.gh.calls))
+        self.assertEqual(self.refs("refs/payload-scratch/"), [])
+        self.assertEqual(self.refs("refs/heads/"), ["refs/heads/main", "refs/heads/payload/1-1"])
+
+    def test_unverified_commit_leaves_no_branch_and_no_scratch_ref(self):
+        self.gh.verified = False
+        with self.assertRaises(payloads.PayloadError) as cm:
+            self.run_propose()
+        self.assertIn("not GitHub-verified", str(cm.exception))
+        self.assertEqual(self.refs("refs/heads/"), ["refs/heads/main"])
+        self.assertEqual(self.refs("refs/payload-scratch/"), [])
+
+    def test_existing_payload_path_is_refused_before_any_push(self):
+        orig = self.gh.call
+
+        def listing_with_payload(method, path, *args, **kw):
+            r = orig(method, path, *args, **kw)
+            if path.endswith("?recursive=1"):
+                r["tree"].append({"path": "payloads/m/1.0.0/MANIFEST.json"})
+            return r
+
+        github_api.call = listing_with_payload
+        with self.assertRaises(payloads.PayloadError) as cm:
+            self.run_propose()
+        self.assertIn("already exists on main", str(cm.exception))
+        self.assertEqual(self.refs("refs/payload-scratch/"), [])
+        self.assertEqual(self.refs("refs/heads/"), ["refs/heads/main"])
 
 
 class Bin(unittest.TestCase):
