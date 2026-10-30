@@ -2,4 +2,4 @@
 # plans and locks decide what a payload is; payload PRs come from publish.yml
 # (github-actions[bot]) and are reviewed against the lock diff and the
 # reproduce status.
-* @Jesssullivan @Cade-1
+* @Jesssullivan
