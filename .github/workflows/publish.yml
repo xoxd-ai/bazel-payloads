@@ -8,7 +8,9 @@ name: publish
 # attest      build provenance for every published file.
 # propose     pushes a payload/<run> branch through the Git Data API with this
 #             workflow's own GITHUB_TOKEN (GitHub-signed commits) and opens the
-#             PR. That PR does not trigger workflows, so a reviewer dispatches
+#             PR. The file bytes go up first by git push to the scratch ref
+#             refs/payload-scratch/<run>-<attempt>, which propose.py deletes
+#             (the REST blob endpoint refuses large files, run 40988958431). That PR does not trigger workflows, so a reviewer dispatches
 #             check.yml and reproduce.yml against it.
 #
 # attest and propose run only on a workflow_dispatch from refs/heads/main with
