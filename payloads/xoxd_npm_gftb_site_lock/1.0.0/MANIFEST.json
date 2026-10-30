@@ -1,0 +1,20 @@
+{
+ "files": {
+  ".pnpmfile.cjs": "5b20be851cc2effa3380d22ee723c8d28c499e9ba31738e6a803f24a1fab5e57",
+  "package.json": "1062042facb7adb8625acf2c71614a6c6228de127a0535063e41c071b6c7228e",
+  "patches/@sveltejs__kit@3.0.1.patch": "c810c90189d973ba981030b1dc1b9adc54d05972baed6464a31cdbcd1f7fff6d",
+  "patches/README.md": "fa0abf2d30070cb34e778145b3f6e6c3ef586b97fe949b8151c68c2e7155c4b8",
+  "patches/devalue@5.9.4.patch": "0856402983a8261d004bdf0d840242d37164311441169dfa7785e16fd57e2339",
+  "patches/svelte-check@4.7.6.patch": "cab8a6d93f9fcfa9f1894f20d9a79a9874f02018ad8b22d8e1cdf0c1c94f8c69",
+  "patches/upstream/README.md": "9f4d028eb603af54c7f8417f39b0d0502738a6f8c0001a949c32f61503a6a9d2",
+  "patches/upstream/sveltejs-devalue-thenable-message.diff": "969348cd1d83b9ebd80aa4fbd8fc4ed1002691c1d5d09cf31ce781e105eda84d",
+  "patches/upstream/sveltejs-kit-sync-typescript7.diff": "5eeaf53c9383862db8774e2e08dd3ee20b91ccff3dbc5084fe98ac9452627efe",
+  "patches/upstream/sveltejs-language-tools-svelte-check-tsgo-stale-emit.diff": "4feb99b356faa5380b37aa21081cfe3dc585732671c94163a966804bffd772fc",
+  "patches/upstream/sveltejs-language-tools-svelte-check-tsgo-typescript7.diff": "e4849dcffb73e1018d243b91cc240ccc39cb2fc0fbf14cc8c33c977aa86c5e84",
+  "pnpm-lock.yaml": "c1c6f5edda832de12de788d8a15011cfa0a5d108fdee2e3ae03a8912ff3e7631",
+  "pnpm-workspace.yaml": "bd98506b84fd79c5f9247a8f150c4bb3f9e8ecac9e223b6bb184c5868f5e4de6"
+ },
+ "module": "xoxd_npm_gftb_site_lock",
+ "source": "locks/gftb-site",
+ "version": "1.0.0"
+}
